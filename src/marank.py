@@ -21,32 +21,42 @@ def get_args():
 	"""
 	args = argparse.ArgumentParser(description="argument parser")
 
-	args.add_argument("-m", type=str, default="MARank", help="model name")
+	args.add_argument("-m", type=str, default="ANRank", help="model name")
 
 	args.add_argument("-lr", type=float, default=0.001)
 	args.add_argument("-reg", type=float, default=0.0005)
-	args.add_argument("-mi", type=int, default=300, help="maximum iteration numbers")
+	args.add_argument("-margin", type=float, default=4.0)
+	args.add_argument("-sm", type=int, default=1000, help="maximum sampling steps")
+	args.add_argument("-mi", type=int, default=150, help="maximum iteration numbers")
 	args.add_argument("-ei", type=int, default=5, help="show progress every ei iterations")
+	args.add_argument("-sp", type=bool, default=True, help="switch to show learning progress")
 	args.add_argument("-k", type=str, default="3+5+10+15+20", help="top-k recommendation")
 	args.add_argument("-data", type=str, default="data/ml100k.rating", help="data path")
 	args.add_argument("-out", type=str, default="explogs/han/yelp_han_att_logs.txt")
 	args.add_argument("-ml", type=int, default=6, help="maximum depend length")
+	args.add_argument("-gl", type=int, default=6, help="maximum depend length")
 
+	args.add_argument("-model", type=str, default="att")
 	args.add_argument("-us", type=int, default=5, help="user threshold")
 	args.add_argument("-sep", type=str, default="tab", help="tab, space")
+	args.add_argument("-decay", type=float, default=0.25, help="skipgram weight decay")
 	args.add_argument("-tp", type=float, default=0.2, help="train & test split")
-	args.add_argument("-lf", type=str, default="f", help="l:leave-one-out or f:fold-out")
+	args.add_argument("-lf", type=str, default="l", help="l:leave-one-out or f:fold-out")
+	args.add_argument("-ew", type=float, default=0.4, help="exp weight")
 
 	# params for neural network
 	args.add_argument("-n_h", type=int, default=64, help="hidden status dimension")
 	args.add_argument("-gpu", dest="gpu", action="store_true", help="indicator to use gpu or not")
 	args.set_defaults(gpu = False)
 
+	args.add_argument("-exp", dest="exp", action="store_true", help="indicator to use gpu or not")
+	args.set_defaults(exp = False)
+
 	args.add_argument("-dn", type=int, default=0, help="device number")
 
 	args.add_argument("-bs", type=int, default=1024, help="batch size")
 	args.add_argument("-grad_clip", type=float, default=5.0)
-	args.add_argument("-dropout", type=float, default=0.8)
+	args.add_argument("-dropout", type=float, default=0.5)
 	args.add_argument("-layers", type=int, default=2, help="number of linear neural layers")
 	args.add_argument("-att_layers", type=int, default=2, help="number of attention layers")
 	args.add_argument("-att_act", type=str, default="tanh",
@@ -58,10 +68,13 @@ def get_args():
 	args.add_argument("-out_act", type=str, default="relu",
 					  help="available choices, relu, identity, tanh")
 
+	args.add_argument("-dyn", dest='dyn', action='store_true', help="dynamic or uniform sampling")
+	args.set_defaults(dyn = False)
+
 	args.add_argument("-prit",dest='prit', action='store_true')
 	args.set_defaults(prit=False)
 
-	args.add_argument("-beta1", type=float, default=0.9)
+	args.add_argument("-beta1", type=float, default=0.5)
 	args.add_argument("-beta2", type=float, default=0.99)
 	args.add_argument("-epsilon", type=float, default=1e-4)
 
@@ -74,12 +87,6 @@ def leaveOneOut(data_path, threshold, sep):
 	data = dataIo.data_filter(data_path, userthreshold=threshold, sep = sep)
 
 	return dataIo.leaveOneOut(data)
-
-def fold_out(data_path, threshold, sep, fold_percent=0.2):
-	dataIo = RecDataIO()
-	data = dataIo.data_filter(data_path, userthreshold=threshold, sep = sep)
-
-	return dataIo.fold_out(data, fold_percent)
 
 def triplet_data(trainRating, testRating, maxLens, winSize):
 
@@ -128,6 +135,58 @@ def triplet_data(trainRating, testRating, maxLens, winSize):
 
 	return triplets,contexts,triplets_test,contexts_test
 
+def new_evaluate(triplets_test, user_latent, gru_latent, item_embs, item_lats):
+	topK=args.k
+	hr = list()
+	ndcg = list()
+	mapn = list()
+	init_time = time.time()
+
+	items = numpy.array(range(itemCount))
+
+	for i in range(len(triplets_test)):
+		score_list = list()
+		pre_items = list()
+
+		user_id = int(triplets_test[i][0])
+		item_id = int(triplets_test[i][1])
+
+		user_row = trainMatrix[user_id]
+		cols = user_row.keys()
+		pre_items = numpy.setdiff1d(items, cols)
+		# pre_items = items
+
+		score_list = 0
+		# item_lats = item_latent[pre_items]
+		user_lat  = user_latent[i]
+		score_list += numpy.dot(user_lat, item_lats.T)
+		score_list += numpy.dot(gru_latent[i], item_embs.T)
+
+		score_list = score_list[pre_items]
+
+		# score_list = numpy.array(score_list)
+		rank = numpy.argpartition(score_list, -topK)[-topK:]
+		rank = rank[numpy.argsort(score_list[rank])]
+		
+		rank_index_list = dict([ (pre_items[ttid],index) for index, ttid in enumerate(list(rank)[::-1])])
+		
+		if item_id in rank_index_list:
+			index = rank_index_list[item_id]
+			hr.append(1.0)
+			ndcg.append(1.0 / math.log(index + 2,2))
+			mapn.append(1.0 / (index+1))
+		else:
+			hr.append(0.0)
+			ndcg.append(0.0)
+			mapn.append(0.0)
+
+	return float("%.4f"%numpy.mean(hr)), float("%.4f"%numpy.mean(ndcg)), float("%.4f"%numpy.mean(mapn))
+
+def fold_out(data_path, threshold, sep, fold_percent=0.2):
+	dataIo = RecDataIO()
+	data = dataIo.data_filter(data_path, userthreshold=threshold, sep = sep)
+
+	return dataIo.fold_out(data, fold_percent)
 
 def fold_triplet_data(trainRating, testRating, maxLens):
 
@@ -324,6 +383,63 @@ def group_seg(group_id):
 	elif group_id == 4:
 		return ">=100"
 
+def posWeight(x):
+	"""
+		@param
+			x: rank position
+		@return
+			w: 1 + 0.5*[ ceil(log(x+1,2)) - 1]
+	"""
+	half = math.ceil(math.log(x+1,2)) - 1
+
+	return 1 + 0.5*half
+
+def newDynSampler(batch, user_latent, gru_latent, item_embs, item_lats):
+
+	weights = list()
+	cnt = 0
+
+	for index, triplet in enumerate(batch):
+		uid, pid, nid = triplet
+		uitems = trainMatrix[uid]
+		
+		xui = numpy.dot(user_latent[index], item_lats[pid])
+		xui += numpy.dot(gru_latent[index], item_embs[pid])
+
+		maxi_steps = args.sm
+		flag = True
+
+		neg_j = 0
+		maxi_value = -float("inf")
+		selected_neg = 0
+		while maxi_steps > 0 and flag:
+
+			while True:
+				neg_j = random.randint(0, itemCount-1)
+				if neg_j not in uitems:
+					break
+			
+			xuj = numpy.dot(user_latent[index], item_lats[neg_j])
+			xuj += numpy.dot(gru_latent[index], item_embs[neg_j])
+
+			xuji = xuj - xui + args.margin
+			if xuji > maxi_value:
+				maxi_value = xuji
+				selected_neg = neg_j
+
+			if xuji > 0: flag = False
+
+			maxi_steps -= 1
+
+		rank = int((itemCount - 1)/(args.sm - maxi_steps))
+
+		weights.append(numpy.float32(posWeight(rank)/posWeight(itemCount)))
+		batch[index][-1] = selected_neg
+
+		if posWeight(rank)/posWeight(itemCount) < 1: cnt += 1
+
+	return batch, weights, cnt
+
 def uniformSampler(batch):
 
 	weights = list()
@@ -340,6 +456,90 @@ def uniformSampler(batch):
 		batch[index][-1] = neg_j
 
 	return batch
+
+def alias_setup(probs):
+	'''
+	Compute utility lists for non-uniform sampling from discrete distributions.
+	Refer to https://hips.seas.harvard.edu/blog/2013/03/03/the-alias-method-efficient-sampling-with-many-discrete-outcomes/
+	for details
+	'''
+	K = len(probs)
+	q = numpy.zeros(K)
+	J = numpy.zeros(K, dtype=numpy.int)
+
+	smaller = []
+	larger = []
+	for kk, prob in enumerate(probs):
+	    q[kk] = K*prob
+	    if q[kk] < 1.0:
+	        smaller.append(kk)
+	    else:
+	        larger.append(kk)
+
+	while len(smaller) > 0 and len(larger) > 0:
+	    small = smaller.pop()
+	    large = larger.pop()
+
+	    J[small] = large
+	    q[large] = q[large] + q[small] - 1.0
+	    if q[large] < 1.0:
+	        smaller.append(large)
+	    else:
+	        larger.append(large)
+
+	return J, q
+
+def alias_draw(J, q):
+	'''
+	Draw sample from a non-uniform discrete distribution using alias sampling.
+	'''
+	K = len(J)
+
+	kk = int(numpy.floor(numpy.random.rand()*K))
+	if numpy.random.rand() < q[kk]:
+		return kk
+	else:
+	    return J[kk]
+
+
+def itemPopDist(trainRating, itemCount):
+	"""
+		sort items in descending order according to the popularity
+	"""
+
+	item_deg = numpy.zeros(itemCount, dtype=numpy.int32)
+
+	for u in range(len(trainRating)):
+		for i in trainRating[u]:
+			item_deg[i] += 1
+
+	nitem_deg = numpy.power(item_deg, args.decay)
+	item_deg = nitem_deg / numpy.sum(nitem_deg)
+
+	return item_deg,nitem_deg
+
+def stat_samp(batch, J, q, itemCount):
+	for index, triplet in enumerate(batch):
+		uid,pid,nid = triplet
+		uitems = trainMatrix[uid]
+
+		neg_j = 0
+		while True:
+			neg_j = alias_draw(J, q)
+			if neg_j not in uitems:
+				break
+
+		batch[index][-1] = neg_j
+
+	return batch
+
+def using_tocoo_izip(x):
+    cx = x.tocoo()
+    train_ratings = list() 
+    for i,j,v in itertools.izip(cx.row, cx.col, cx.data):
+        train_ratings.append((i,j,v))
+
+    return train_ratings
 
 def trainDict(trainRating):
 	
@@ -362,6 +562,7 @@ class MultiRel(object):
 		self.itemCount = itemCount
 		self.userCount = userCount
 		self.maxLens = args.ml
+		self.gloMaxLens = args.gl
 		self.att_layers = args.att_layers
 		self.att_act_fnc = args.att_act
 		self.in_act = args.in_act
@@ -376,6 +577,9 @@ class MultiRel(object):
 		self.device_name = "cpu"
 		self.device_name_emb = "cpu"
 		self.device_number = args.dn
+		self.dynSampler = args.dyn
+		self.trainOrInf = True
+		self.neu_l2 = 1.0 / self.n_linear_layers
 
 		if args.gpu:
 			self.device_name = "gpu"
@@ -392,8 +596,9 @@ class MultiRel(object):
 
 			# ===================== placeholders =======================================
 			self.triplets = tf.placeholder(tf.int32, [None, 3])
+			self.ws      = tf.placeholder(tf.float32, [None])
 			self.local_contexts = tf.placeholder(tf.int32, [None, self.maxLens])
-			self.keep_prob = tf.placeholder(tf.float32, name="keep_prob")
+			self.global_contexts = tf.placeholder(tf.int32, [None, self.gloMaxLens])
 			
 			# ===================== build model =====================================
 			user_latent = tf.nn.embedding_lookup(self.embeddings["user_latent"], self.triplets[:,0])
@@ -404,6 +609,7 @@ class MultiRel(object):
 			p_lat = tf.nn.embedding_lookup(self.embeddings["item_context"], self.triplets[:,1])
 			n_lat = tf.nn.embedding_lookup(self.embeddings["item_context"], self.triplets[:,2])
 
+		with tf.device('/{0}'.format(self.device_name)):
 			iloc_embs = tf.nn.embedding_lookup(self.embeddings["item_context"], self.local_contexts)
 			iloc_att_embs = self.itemContAtt(iloc_embs, user_latent)
 
@@ -418,9 +624,11 @@ class MultiRel(object):
 
 			uihid_agg_emb = self.hidAtt(uihid_att_embs)
 
-			self.neu_embs = self.res_nn(uihid_agg_emb)
+			aggre_embs = self.res_nn(uihid_agg_emb)
+			self.neu_embs =  aggre_embs + uihid_agg_emb
 			
 			# ===================== prediction difference =====================================
+			# diff = tf.reduce_sum(tf.multiply(self.neu_embs, tf.subtract(self.pi_embs, self.ni_embs)), axis=1)
 			
 			self.diff1 = tf.reduce_sum(tf.multiply(self.neu_embs, tf.subtract(p_lat, n_lat)), axis=1)
 			self.diff2 = tf.reduce_sum(tf.multiply(user_latent, tf.subtract(pi_latent, ni_latent)), axis=1)
@@ -432,11 +640,12 @@ class MultiRel(object):
 			+ tf.reduce_sum(tf.multiply(ni_latent, ni_latent), axis=1) \
 			+ tf.reduce_sum(tf.multiply(p_lat,p_lat), axis=1) \
 			+ tf.reduce_sum(tf.multiply(n_lat,n_lat), axis=1) \
-			+ tf.reduce_sum(tf.multiply(uihid_agg_emb, uihid_agg_emb),axis=1)
+			+ tf.reduce_sum(tf.multiply(uihid_agg_emb, uihid_agg_emb),axis=1) \
+			+ tf.reduce_sum(tf.multiply(aggre_embs, aggre_embs), axis = 1)
 
 			self.Loss_0 = - tf.log(tf.sigmoid(diff))
 
-			self.Loss_0 = tf.add(self.Loss_0, self.args.reg * self.L2_emb)
+			self.Loss_0 = self.ws * tf.add(self.Loss_0, self.args.reg * self.L2_emb)
 
 			self.error_emb = tf.reduce_sum(self.Loss_0)
 			self.error_nn = self.error_emb/self.batch_1_size/self.maxLens
@@ -472,6 +681,10 @@ class MultiRel(object):
 			self.sess = tf.Session(config=config)
 			self.sess.run(opt)
 
+	def metric_dist(self, src, tar):
+		dist_vec = src - tar
+		return tf.reduce_sum(tf.multiply(dist_vec, dist_vec))
+
 	def res_nn(self, aggre_embs):
 		"""
 			forward to residual neural network
@@ -485,13 +698,32 @@ class MultiRel(object):
 
 		for i in range(self.n_linear_layers):
 			layer = "layer_%d"%i
-			dropout_layer = tf.nn.dropout(out, self.keep_prob)
+			dropout_layer = tf.layers.dropout(out, rate=self.dropout, training=self.trainOrInf)
 			out = tf.add(tf.matmul(dropout_layer,self.weights[layer]), self.biases[layer])
 			out = tf.add(out, pre)
 
-			out = tf.nn.relu(out)
-			
+			if i < self.n_linear_layers - 1: # not last layer
+				if self.in_act == "sigmoid": # sigmoid, tanh, relu
+					out = tf.sigmoid(out)
+				elif self.in_act == "tanh":
+					out = tf.tanh(out)
+				else:
+					out = tf.nn.relu(out)
+			else:
+				if self.out_act == "relu": # relu, identity, tanh
+					out = tf.nn.relu(out)
+				elif self.out_act == "tanh":
+					out = tf.tanh(out)
+				else:
+					out = out
+
 			pre = out
+
+			# hid_units[i] = tf.reshape(out, [-1,1,self.n_hidden])
+
+		# hid_units = tf.concat(hid_units, 1)
+
+		# out = self.hidAtt(hid_units)
 		
 		return out
 
@@ -503,19 +735,24 @@ class MultiRel(object):
 		
 		out = aggre_embs
 		
+
 		hid_units = [None for i in range(self.att_layers)]
 
 		for i in range(self.att_layers):
 			layer = "ulayer_%d"%i
 			pre = out
 
-			dropout_layer = tf.nn.dropout(out, self.keep_prob)
+			dropout_layer = tf.layers.dropout(out, rate=self.dropout, training=self.trainOrInf)
 			out = tf.add(tf.matmul(dropout_layer,self.weights[layer]), self.biases[layer])
 			out = tf.add(out, pre)
 			
 			out = tf.nn.relu(out)
 			
 			hid_units[i] = out
+
+		# hid_units = tf.concat(hid_units, 1)
+
+		# out = self.hidAtt(hid_units)
 		
 		return hid_units
 
@@ -532,7 +769,7 @@ class MultiRel(object):
 			layer = "ilayer_%d"%i
 			pre = tf.reshape(pre, [-1,self.n_hidden])
 
-			dropout_layer = tf.nn.dropout(pre, self.keep_prob)
+			dropout_layer = tf.layers.dropout(pre, rate=self.dropout, training=self.trainOrInf)
 			out = tf.add(tf.matmul(dropout_layer,self.weights[layer]), self.biases[layer])
 			out = tf.add(out, pre)
 			pre = tf.reshape(tf.nn.relu(out), [-1, self.maxLens, self.n_hidden])
@@ -550,11 +787,11 @@ class MultiRel(object):
 			desired output tensor shape: batch, col
 		"""
 
-		drop_item_embs = tf.nn.dropout(item_embs,self.keep_prob)
+		drop_item_embs = tf.layers.dropout(item_embs,rate=self.dropout, training=self.trainOrInf)
 		wi = tf.matmul(tf.reshape(drop_item_embs,[-1,self.n_hidden]), self.weights["i/att/item/weight"])
 		wi = tf.reshape(wi, [-1, self.maxLens, self.n_hidden])
 
-		drop_user_embs = tf.nn.dropout(user_embs, self.keep_prob)
+		drop_user_embs = tf.layers.dropout(user_embs, rate=self.dropout, training=self.trainOrInf)
 		wu = tf.matmul(drop_user_embs, self.weights["i/att/user/weight"])
 		wu = tf.reshape(wu, [-1,1,self.n_hidden])
 
@@ -591,11 +828,11 @@ class MultiRel(object):
 		
 		for i in range(self.att_layers):
 			
-			drop_item_embs = tf.nn.dropout(ihid_units[i],self.keep_prob)
+			drop_item_embs = tf.layers.dropout(ihid_units[i],rate=self.dropout, training=self.trainOrInf)
 			wi = tf.matmul(tf.reshape(drop_item_embs,[-1,self.n_hidden]), self.weights["hid/att/rel/item/weight_%d"%i])
 			wi = tf.reshape(wi, [-1, self.maxLens, self.n_hidden])
 
-			drop_user_embs = tf.nn.dropout(uhid_units[i], self.keep_prob)
+			drop_user_embs = tf.layers.dropout(uhid_units[i], rate=self.dropout, training=self.trainOrInf)
 			wu = tf.matmul(drop_user_embs, self.weights["hid/att/rel/user/weight_%d"%i])
 			wu = tf.reshape(wu, [-1,1,self.n_hidden])
 
@@ -625,7 +862,7 @@ class MultiRel(object):
 			input hidden_embs: [batch, layers, dim]
 		"""
 
-		drop_hid_embs = tf.nn.dropout(hidden_embs, self.keep_prob)
+		drop_hid_embs = tf.layers.dropout(hidden_embs, rate = self.dropout, training = self.trainOrInf)
 		wh = tf.matmul(tf.reshape(drop_hid_embs, [-1, self.n_hidden]), self.weights["hid/att/weight"])
 		wh = tf.reshape(wh, [-1, self.att_layers+1, self.n_hidden])
 
@@ -705,6 +942,7 @@ class MultiRel(object):
 
 		triplets_test, contexts_test = test_data
 		
+		
 		triplets = train_triplets
 		contexts = train_contents
 		weights = train_weights
@@ -725,12 +963,18 @@ class MultiRel(object):
 
 				triplets_batch = triplets[j*self.batch_1_size:(j+1)*self.batch_1_size]
 				contexts_batch = contexts[j*self.batch_1_size:(j+1)*self.batch_1_size]
+				weight_batch = weights[j*self.batch_1_size:(j+1)*self.batch_1_size]
 
+				self.trainOrInf = False
 				feed_dict = {self.triplets: triplets_batch,
 							self.local_contexts: contexts_batch,
-							self.keep_prob: self.dropout}
-				
-				triplets_batch = uniformSampler(triplets_batch)
+							self.ws: weight_batch}
+				if args.exp:
+					triplets_batch = stat_samp(triplets_batch, J, q, itemCount)
+				else:
+					triplets_batch = uniformSampler(triplets_batch)
+
+				self.trainOrInf = True
 
 				try:
 					self.sess.run([self.minimize_emb, self.minimize_nn], feed_dict)
@@ -741,28 +985,37 @@ class MultiRel(object):
 
 			triplets_batch = triplets[j*self.batch_1_size:(j+1)*self.batch_1_size]
 			contexts_batch = contexts[j*self.batch_1_size:(j+1)*self.batch_1_size]
+			weight_batch = weights[j*self.batch_1_size:(j+1)*self.batch_1_size]
+			
+			self.trainOrInf = False
 			feed_dict = {self.triplets: triplets_batch,
 						self.local_contexts: contexts_batch,
-						self.keep_prob: self.dropout}
+						self.ws: weight_batch}
 
-			triplets_batch = uniformSampler(triplets_batch)
-
+			if args.exp:
+				triplets_batch = stat_samp(triplets_batch, J, q, itemCount)
+			else:
+				triplets_batch = uniformSampler(triplets_batch)
+				
+			self.trainOrInf = True
 			self.sess.run([self.minimize_emb, self.minimize_nn], feed_dict)
 
 			iter_time = time.time() - begin_time
 
 			if((epo+1)%args.ei == 0):
-				
+				self.trainOrInf = False
 				begin_time = time.time()
 
 				test_users = [(i,0,0) for i in range(userCount)]
 				feed_dict = {self.triplets: test_users,
-							self.local_contexts: contexts_test,
-							self.keep_prob: 1}
+							self.local_contexts: contexts_test}
 
+				emb_ext_time = time.time()
 				user_lats, neu_embs = self.sess.run([self.embeddings["user_latent"], self.neu_embs], feed_dict)
 				item_embs, item_lats  = self.sess.run([self.embeddings["item_context"], self.embeddings["item_latent"]])
 				
+				end_ext_time = time.time()
+
 				user_lats = numpy.concatenate((user_lats, neu_embs), axis = 1)
 				item_lats = numpy.concatenate((item_lats, item_embs), axis = 1)
 
@@ -770,16 +1023,16 @@ class MultiRel(object):
 
 				topKs = [int(v) for v in args.k.split("+")]
 
-				print "=================== Iter-%d: %.4fm, Eva:%.4fm ==================="%(epo+1,iter_time/60,(time.time() - begin_time)/60)
+				print "=================== Iter-%d: %.4fm, Eva:%.4fm, Ext:%.4fs ==================="%(epo+1,iter_time/60,(time.time() - begin_time)/60, end_ext_time - emb_ext_time)
 				res_str = ""
 				for index, k in enumerate(topKs):
-					res_str += "HR:{0},P:{1},NDCG:{2},MRR:{3},-N:{4}- ".format(hrs[index],pres[index],ndcgs[index],mapns[index],k)
+					res_str += "HR:{0},P:{1},NDCG:{2},MAP:{3},-N:{4}- ".format(hrs[index],pres[index],ndcgs[index],mapns[index],k)
 				print res_str
 
 				group_res_str = ""
 				for index in range(5):
 					gstr = group_seg(index)
-					group_res_str += "HR:{0},P:{1},NDCG:{2},MRR:{3}, {4};".format(ghr[index],gpre[index],gndcg[index],gmapn[index],gstr)
+					group_res_str += "HR:{0},P:{1},NDCG:{2},MAP:{3}, {4};".format(ghr[index],gpre[index],gndcg[index],gmapn[index],gstr)
 				print group_res_str
 
 		self.sess.close()
@@ -798,8 +1051,7 @@ elif args.sep == "space":
 else:
 	sep = ","
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '{0}'.format(args.dn)
-
+# project_base = os.path.dirname(cwd)
 data_path = os.path.join(cwd, args.data)
 
 # get sparse training matrix
@@ -810,6 +1062,9 @@ else:
 
 userCount, itemCount = trainMatrix.shape
 
+itemDist, nonItemDist = itemPopDist(trainRating, itemCount)
+J, q = alias_setup(itemDist)
+
 trainMatrix = trainDict(trainRating)
 
 if __name__ == "__main__":
@@ -818,8 +1073,4 @@ if __name__ == "__main__":
 	lists = fold_triplet_data(trainRating, testRating, args.ml)
 
 	model.train_model(train_data = lists[0], test_data = lists[1])
-
-		
-
-
 
