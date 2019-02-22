@@ -74,7 +74,7 @@ def get_args():
 	args.add_argument("-prit",dest='prit', action='store_true')
 	args.set_defaults(prit=False)
 
-	args.add_argument("-beta1", type=float, default=0.5)
+	args.add_argument("-beta1", type=float, default=0.9)
 	args.add_argument("-beta2", type=float, default=0.99)
 	args.add_argument("-epsilon", type=float, default=1e-4)
 
